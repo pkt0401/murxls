@@ -9,7 +9,7 @@ import re
 
 class LID:
     """
-    언어 식별을 위한 클래스로, FLORES 형식의 언어 코드를 지원합니다.
+    Language identification class that supports FLORES language codes.
     """
     def __init__(self, target_lang_code):
         try:
@@ -18,7 +18,7 @@ class LID:
         except Exception as e:
             print(f"Error loading fasttext model: {str(e)}")
             print("Trying to use local model if available...")
-            # 로컬 경로에서 모델 로드 시도
+            # Try loading model from local paths
             local_paths = ["./lid.176.bin", "./lid.176.ftz", "./model.bin"]
             model_loaded = False
             for path in local_paths:
@@ -34,10 +34,10 @@ class LID:
             if not model_loaded:
                 raise ValueError("Could not load fasttext model from any location")
         
-        # 대상 언어 코드 (FLORES 형식)
+        # Target language code (FLORES format)
         self.target_lang_code = target_lang_code
         
-        # 타겟 언어 감지를 위한 fastText 레이블 형식 (예: __label__eng_Latn)
+        # Target language detection fastText label format (e.g., __label__eng_Latn)
         self.target_fasttext_label = f"__label__{self.target_lang_code}"
         
         print(f"Target language code: {self.target_lang_code}")
@@ -99,12 +99,13 @@ class LID:
 
 def find_text_files(output_dir, pattern):
     """
-    주어진 출력 디렉토리와 파일 패턴에 맞는 파일들을 찾습니다.
+    Find files matching the given pattern in the output directory.
+    Also checks for files in the output directory structure created by main.py.
     """
-    # 직접 패턴 일치 검색
+    # Direct pattern matching
     files = glob.glob(os.path.join(output_dir, pattern))
     
-    # main.py 출력 구조에 맞는 파일 검색 (summaries.txt)
+    # Check for files in the outputs directory structure from main.py
     model_dirs = glob.glob(os.path.join(output_dir, "outputs", "*"))
     for model_dir in model_dirs:
         if os.path.isdir(model_dir):
@@ -138,15 +139,15 @@ def is_data_file(filename):
 
 def process_text_file(file_path, target_lang_code):
     """
-    텍스트 파일을 읽고 LID 평가를 수행합니다.
-    파일은 각 줄이 하나의 텍스트 샘플을 포함하는 형식이어야 합니다.
+    Read a text file and perform language identification evaluation.
+    The file should have one text sample per line.
     """
-    # 파일 존재 확인
+    # Check if file exists
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
         return None, None
     
-    # 텍스트 파일 읽기 (여러 인코딩 시도)
+    # Read text file (trying multiple encodings)
     encodings_to_try = ['utf-8', 'cp1252', 'latin1', 'iso-8859-1']
     texts = None
     
@@ -159,7 +160,7 @@ def process_text_file(file_path, target_lang_code):
             continue
     
     if texts is None:
-        # 모든 인코딩 시도 실패 시 바이너리 모드로 시도
+        # If all encoding attempts fail, try binary mode
         try:
             with open(file_path, 'rb') as f:
                 binary_data = f.read()
@@ -168,7 +169,7 @@ def process_text_file(file_path, target_lang_code):
             print(f"Error reading file {file_path}: {str(e)}")
             return None, None
     
-    # 빈 줄 제거
+    # Remove empty lines
     texts = [t for t in texts if t.strip()]
     
     if not texts:
@@ -177,28 +178,28 @@ def process_text_file(file_path, target_lang_code):
     
     print(f"Loaded {len(texts)} text samples from {file_path}")
     
-    # 샘플 텍스트 출력
+    # Print sample texts
     print("\nSample texts:")
     for i, text in enumerate(texts[:2]):
         print(f"{i+1}: {text[:100]}{'...' if len(text) > 100 else ''}")
     
-    # LID 평가기 초기화
+    # Initialize LID evaluator
     try:
         evaluator = LID(target_lang_code)
     except Exception as e:
         print(f"Error initializing LID evaluator: {str(e)}")
         return None, None
     
-    # 언어 식별 평가 수행
+    # Perform language identification evaluation
     accuracy, scores = evaluator(texts)
     
-    # 결과 분석 및 저장
+    # Analyze and save results
     results = pd.DataFrame({
         'text': texts,
         'is_correct_language': scores
     })
     
-    # 결과 저장
+    # Save results
     output_dir = os.path.dirname(file_path)
     output_name = f"{os.path.splitext(os.path.basename(file_path))[0]}_lid_results.csv"
     output_path = os.path.join(output_dir, output_name)
@@ -213,16 +214,16 @@ def process_text_file(file_path, target_lang_code):
 
 def process_language_pairs(files_dir, language_pairs, specific_pair=None):
     """
-    여러 언어 쌍 파일에 대해 언어 식별을 수행합니다.
+    Perform language identification on multiple language pair files.
     
     Args:
-        files_dir: 파일들이 위치한 디렉토리
-        language_pairs: 언어 쌍과 파일명 패턴의 매핑
-        specific_pair: 특정 언어 쌍만 처리하려면 지정 (기본값: None, 모든 쌍 처리)
+        files_dir: Directory containing the files
+        language_pairs: Mapping of language pairs and file patterns
+        specific_pair: Process only this specific language pair if specified (default: None = all pairs)
     """
     results = {}
     
-    # 특정 언어 쌍 처리 또는 모든 언어 쌍 처리
+    # Process specific language pair or all pairs
     pairs_to_process = {specific_pair: language_pairs[specific_pair]} if specific_pair else language_pairs
     
     for pair_name, (source_lang, target_lang, file_pattern) in pairs_to_process.items():
@@ -230,7 +231,7 @@ def process_language_pairs(files_dir, language_pairs, specific_pair=None):
         print(f"Processing language pair: {pair_name} ({source_lang} -> {target_lang})")
         print(f"{'='*50}")
         
-        # 패턴에 맞는 파일 찾기
+        # Find matching files
         file_paths = find_text_files(files_dir, file_pattern)
         file_paths = [f for f in file_paths if is_data_file(os.path.basename(f))]
         
@@ -249,7 +250,7 @@ def process_language_pairs(files_dir, language_pairs, specific_pair=None):
                     'accuracy': accuracy
                 }
     
-    # 결과 요약
+    # Summarize results
     print("\n" + "="*120)
     print("Summary of language evaluation:")
     print("="*120)
@@ -261,7 +262,7 @@ def process_language_pairs(files_dir, language_pairs, specific_pair=None):
         pair = f"{info['source_lang']} -> {info['target_lang']}"
         print(f"{file_name:<70} | {pair:<20} | {info['accuracy']:.2%}")
     
-    # 결과를 CSV로 저장
+    # Save results to CSV
     df_results = pd.DataFrame([
         {
             'file': file_path,
@@ -278,7 +279,8 @@ def process_language_pairs(files_dir, language_pairs, specific_pair=None):
     
     return results
 
-# 언어 쌍 정의 (소스 언어, 타겟 언어, 파일 패턴)
+# Language pairs definition (source language, target language, file pattern)
+# Using FLORES language codes for language identification
 language_pairs = {
     'English-Thai': ('eng_Latn', 'tha_Thai', '*english-thai*'),
     'English-Gujarati': ('eng_Latn', 'guj_Gujr', '*english-gujarati*'),
