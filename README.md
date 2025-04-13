@@ -1,6 +1,6 @@
-# MuRXLS: Multilingual Retrieval-based Cross-lingual Summarization
+# MuRXLS: Cross-Lingual Summarization for Low-Resource Languages using Multilingual Retrieval-Based In-Context Learning
 
-This repository implements the Multilingual Retrieval-based Cross-lingual Summarization (MuRXLS) approach described in the paper "Cross-Lingual Summarization for Low-Resource Languages using Multilingual Retrieval-Based In-Context Learning".
+This repository implements the Cross-Lingual Summarization for Low-Resource Languages using Multilingual Retrieval-Based In-Context Learning (MuRXLS) approach described in the paper "Cross-Lingual Summarization for Low-Resource Languages using Multilingual Retrieval-Based In-Context Learning".
 
 MuRXLS is a robust framework that dynamically selects the most relevant summarization examples for each article using multilingual retrieval, enhancing cross-lingual summarization performance particularly for low-resource languages.
 
