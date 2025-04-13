@@ -1,580 +1,519 @@
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tqdm import tqdm
+import argparse
+import os
 import pandas as pd
 import numpy as np
-import torch.nn as nn
-import os
-import warnings
-import re
-from rouge_score import rouge_scorer
+from tqdm import tqdm
+import nltk
 from nltk.tokenize import sent_tokenize
+from rouge_score import rouge_scorer
+import re
 import csv
-from FlagEmbedding import BGEM3FlagModel  # SentenceTransformer 대신 BGE-M3 모델 임포트
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report
 
-# NLTK 데이터 다운로드 (첫 실행 시 필요)
+# Ensure NLTK data is downloaded
 try:
-    import nltk
     nltk.download('punkt', quiet=True)
 except:
-    print("NLTK 다운로드 중 오류가 발생했습니다. 이미 설치되어 있을 수 있습니다.")
+    print("NLTK download failed. May already be installed.")
 
-# 모델명과 언어쌍 설정
-model_name = "mis3"      # 모델명 (예: "mis3" for Mistral-3)
-src_lang = "english"     # 원본 언어: 영어
-tgt_lang = "thai"        # 대상 언어: 태국어
-lang_pair = f"{src_lang}-{tgt_lang}"  # "english-thai"
-
-# Try to import deepspeed, but have a fallback if it fails
-try:
-    import deepspeed
-    use_deepspeed = True
-    # Try DeepSpeed initialization, but catch errors
-    try:
-        deepspeed.init_distributed()
-        deepspeed_initialized = True
-    except (ImportError, RuntimeError, OSError) as e:
-        print(f"DeepSpeed initialization failed: {e}")
-        print("Continuing without DeepSpeed distributed mode...")
-        deepspeed_initialized = False
-except ImportError:
-    print("DeepSpeed not available. Using standard PyTorch.")
-    use_deepspeed = False
-    deepspeed_initialized = False
-
-# 모델 및 토크나이저 로드 - v0.3으로 변경
-print("Loading Mistral model v0.3...")
-try:
-    # 먼저 로컬에서 로드 시도
-    model = AutoModelForCausalLM.from_pretrained(
-        "mistralai/Mistral-7B-Instruct-v0.3",  # v0.3 사용
-        local_files_only=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        "mistralai/Mistral-7B-Instruct-v0.3",  # v0.3 사용
-        local_files_only=True
-    )
-    print("Models loaded from local cache")
-except Exception as e:
-    print(f"Local loading failed: {e}")
-    print("Attempting to download models (this may take a while)...")
-    # 로컬 로드 실패시 다운로드 시도
-    model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")  # v0.3 사용
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")  # v0.3 사용
-
-# BGE-M3 모델 로드 - SentenceTransformer 대신
-print("Loading BGE-M3 model...")
-retriever = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
-print("BGE-M3 model loaded")
-
-# Check GPU availability
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-# Setup for multi-GPU if available
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs!")
-    model = nn.DataParallel(model)
-
-# Move model to device
-model = model.to(device)
-
-# Initialize DeepSpeed engine if available and initialized
-if use_deepspeed and deepspeed_initialized:
-    try:
-        model_engine, _, _, _ = deepspeed.initialize(
-            model=model,
-            model_parameters=model.parameters(),
-            config={
-                "train_micro_batch_size_per_gpu": 1,
-                "fp16": {"enabled": True}
-            }
-        )
-        use_model_engine = True
-        print("DeepSpeed engine initialized successfully")
-    except Exception as e:
-        print(f"DeepSpeed engine initialization failed: {e}")
-        print("Falling back to standard model...")
-        use_model_engine = False
-else:
-    use_model_engine = False
-    print("Using standard PyTorch (no DeepSpeed)")
-
-# 데이터 경로 설정
-data_name = f"{src_lang}-{tgt_lang}"
-shot_data = f"./english_csv/val/{data_name}_val.csv"
-test_data = f"./english_csv/test/{data_name}_test.csv"
-
-# 출력 파일 경로 설정
-output_name = f"{model_name}_v03_{lang_pair}_dynamic_example_bgem3"
-output_dir = f"./mistral_outputs/dynamic_example/{output_name}"
-
-# 디버깅 로그 디렉토리 생성
-log_dir = f"./mistral_outputs/retrieval_logs"
-
-# 개별 출력 디렉토리 생성 - 각 샘플별 전체 출력을 저장
-samples_dir = f"./mistral_outputs/samples_output"
-
-# 클렌징된 출력 디렉토리 생성
-cleansed_output_dir = f"./mistral_outputs/cleansed_outputs"
-
-# CSV 결과 파일 경로
-csv_output_file = f"{output_dir}_results.csv"
-
-# Create output directories if they don't exist
-os.makedirs(os.path.dirname(output_dir), exist_ok=True)
-os.makedirs(log_dir, exist_ok=True)
-os.makedirs(samples_dir, exist_ok=True)
-os.makedirs(cleansed_output_dir, exist_ok=True)
-
-# 데이터 로드 - 인덱스 재설정 적용
-print(f"Loading data from {shot_data} and {test_data}")
-try:
-    # 슬라이싱 시에도 인덱스를 0부터 시작하도록 reset_index 적용
-    test_samples = pd.read_csv(test_data, encoding="utf-8")
-    shot_samples = pd.read_csv(shot_data, encoding='utf-8')
-    print(f"Loaded {len(test_samples)} test samples and {len(shot_samples)} validation samples")
-except Exception as e:
-    print(f"Error loading CSV files: {e}")
-    raise
-
-# Define a variable to track any skipped items due to OOM
-oom_list = []
-
-# ROUGE 점수와 유사도 점수를 누적하기 위한 변수들 초기화
-rouge_scorer_instance = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL', 'rougeLsum'], use_stemmer=True)
-rouge1_scores = []
-rouge2_scores = []
-rougeL_scores = []
-rougeLsum_scores = []
-
-# 토크나이저 설정
-tokenizer.pad_token = tokenizer.eos_token
-
-# 샘플 수 제한 - 디버깅 목적으로 적은 수의 샘플만 처리
-MAX_SAMPLES = len(test_samples)  # 전체 샘플 처리, 필요에 따라 조정
-
-# 언어 설정
-language = tgt_lang.capitalize()  # 첫 글자 대문자로 변환 (예: "thai" -> "Thai")
-
-# 디버깅용 출력 내용 검사 함수
-def inspect_response(response, index, debug_file):
-    debug_file.write(f"===== SAMPLE {index} RESPONSE INSPECTION =====\n")
-    debug_file.write(f"Original Length: {len(response)}\n")
-    debug_file.write(f"First 200 chars: {response[:200]}...\n")
-    debug_file.write(f"Last 200 chars: {response[-200:] if len(response) > 200 else response}\n")
+def setup_output_directories(model_name, lang_pair):
+    """
+    Create necessary output directories for evaluation results.
+    """
+    # Main output directory
+    output_dir = f"./outputs/{model_name}/{lang_pair}"
     
-    # 프롬프트 반복 패턴 검사
-    prompt_repetitions = response.count("Please summarize the following text in")
-    debug_file.write(f"Number of 'Please summarize' occurrences: {prompt_repetitions}\n")
+    # Evaluation results directory
+    eval_dir = f"./outputs/{model_name}/{lang_pair}/evaluation"
     
-    # 'Translated summary:' 패턴 검사
-    translated_occurrences = response.count("Translated summary:")
-    debug_file.write(f"Number of 'Translated summary:' occurrences: {translated_occurrences}\n")
-    
-    # Assistant/User 태그 검사
-    assistant_tags = response.count("<|im_start|>assistant")
-    user_tags = response.count("<|im_start|>user")
-    debug_file.write(f"Number of assistant tags: {assistant_tags}\n")
-    debug_file.write(f"Number of user tags: {user_tags}\n\n")
+    # Create directories
+    os.makedirs(eval_dir, exist_ok=True)
     
     return {
-        "prompt_repetitions": prompt_repetitions,
-        "translated_occurrences": translated_occurrences,
-        "assistant_tags": assistant_tags,
-        "user_tags": user_tags
+        "base": output_dir,
+        "eval_dir": eval_dir,
+        "summaries_path": f"{output_dir}/summaries.txt",
+        "metrics_path": f"{eval_dir}/metrics.csv",
+        "final_metrics_path": f"{eval_dir}/final_metrics.txt",
+        "figures_dir": f"{eval_dir}/figures"
     }
 
-# 언어에 독립적인 추출 로직
-def extract_translation_from_response(response, index, debug_file):
-    # 응답 구조 분석
-    inspection_result = inspect_response(response, index, debug_file)
-    
-    # 응답에서 요약 추출
-    debug_file.write(f"===== EXTRACTION ATTEMPT FOR SAMPLE {index} =====\n")
-    
-    # 가능한 추출 방법들
-    extracted_summary = None
-    
-    # 방법 1: 마지막 "Translated summary:" 이후의 모든 텍스트
-    if inspection_result["translated_occurrences"] > 0:
-        last_idx = response.rfind("Translated summary:")
-        if last_idx != -1:
-            # 다음 프롬프트까지의 텍스트만 추출
-            next_prompt_idx = response.find("Please summarize", last_idx)
-            if next_prompt_idx != -1:
-                extracted_summary = response[last_idx + len("Translated summary:"):next_prompt_idx].strip()
-            else:
-                extracted_summary = response[last_idx + len("Translated summary:"):].strip()
-            
-            debug_file.write(f"Method 1 (Last 'Translated summary:'): Found at position {last_idx}\n")
-            debug_file.write(f"Extracted: {extracted_summary[:100]}...\n\n")
-    
-    # 방법 2: assistant 태그 이후의 텍스트
-    if extracted_summary is None and inspection_result["assistant_tags"] > 0:
-        last_assistant_idx = response.rfind("<|im_start|>assistant")
-        if last_assistant_idx != -1:
-            end_idx = response.find("<|im_end|>", last_assistant_idx)
-            if end_idx != -1:
-                assistant_text = response[last_assistant_idx + len("<|im_start|>assistant"):end_idx].strip()
-            else:
-                assistant_text = response[last_assistant_idx + len("<|im_start|>assistant"):].strip()
-            
-            # 어시스턴트 텍스트에서 Translated summary: 검색
-            trans_idx = assistant_text.rfind("Translated summary:")
-            if trans_idx != -1:
-                extracted_summary = assistant_text[trans_idx + len("Translated summary:"):].strip()
-            else:
-                extracted_summary = assistant_text
-            
-            debug_file.write(f"Method 2 (Assistant tag): Found at position {last_assistant_idx}\n")
-            debug_file.write(f"Extracted: {extracted_summary[:100]}...\n\n")
-    
-    # 방법 3: [/INST] 태그 이후의 텍스트 (Mistral의 경우)
-    if extracted_summary is None:
-        inst_idx = response.rfind("[/INST]")
-        if inst_idx != -1:
-            # 다음 프롬프트까지만 추출
-            next_prompt_idx = response.find("Please summarize", inst_idx)
-            if next_prompt_idx != -1:
-                extracted_summary = response[inst_idx + len("[/INST]"):next_prompt_idx].strip()
-            else:
-                extracted_summary = response[inst_idx + len("[/INST]"):].strip()
-            
-            debug_file.write(f"Method 3 ([/INST] tag): Found at position {inst_idx}\n")
-            debug_file.write(f"Extracted: {extracted_summary[:100]}...\n\n")
-    
-    # 방법 4: 특수 패턴 - 반복되는 프롬프트 사이의 텍스트
-    if extracted_summary is None and inspection_result["prompt_repetitions"] > 1:
-        # 첫 번째 프롬프트 이후의 인덱스
-        first_prompt_end = response.find("Translated summary:", response.find("Please summarize"))
-        if first_prompt_end != -1:
-            # 두 번째 프롬프트의 시작 인덱스
-            second_prompt_start = response.find("Please summarize", first_prompt_end)
-            if second_prompt_start != -1:
-                extracted_summary = response[first_prompt_end + len("Translated summary:"):second_prompt_start].strip()
-                debug_file.write(f"Method 4 (Between prompts): Extracted from {first_prompt_end} to {second_prompt_start}\n")
-                debug_file.write(f"Extracted: {extracted_summary[:100]}...\n\n")
-    
-    # 추출 결과 정리
-    if extracted_summary is None:
-        debug_file.write("No extraction method worked. Using full response.\n\n")
-        return response.strip()
-    
-    return extracted_summary
-
-# 간소화된 후처리 함수
-def clean_summary(summary):
-    # 여러 줄 공백을 한 줄로 변경
-    cleaned = re.sub(r'\n\s*\n', '\n', summary)
-    
-    return cleaned.strip()
-
-# 가장 유사한 예제 찾기 함수 - BGE-M3 모델용으로 수정
-def find_most_similar_example(query_text, shot_samples, retriever):
+def load_data(src_lang, tgt_lang):
     """
-    주어진 쿼리 텍스트와 가장 유사한 예제를 찾는 함수
+    Load test data containing reference summaries.
+    Uses data from the CrossSum_dataset directory.
+    """
+    data_name = f"{src_lang}-{tgt_lang}"  # e.g., "english-thai"
+    
+    # Try to find the CrossSum_dataset directory
+    crosssum_dirs = [
+        "./CrossSum_dataset/",
+        "../CrossSum_dataset/",
+        "../../CrossSum_dataset/"
+    ]
+    
+    crosssum_dir = None
+    for d in crosssum_dirs:
+        if os.path.exists(d):
+            crosssum_dir = d
+            break
+    
+    if not crosssum_dir:
+        raise FileNotFoundError("Could not find CrossSum_dataset directory. Please make sure it exists in the current or parent directory.")
+    
+    # Test path in CrossSum_dataset structure
+    test_path = os.path.join(crosssum_dir, "test", f"{data_name}.csv")
+    
+    # Check if alternate path exists
+    if not os.path.exists(test_path):
+        # Try with swapped language order
+        reversed_data_name = f"{tgt_lang}-{src_lang}"
+        test_path = os.path.join(crosssum_dir, "test", f"{reversed_data_name}.csv")
+    
+    # Check if file exists
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Could not find test data file for {src_lang}-{tgt_lang} in CrossSum_dataset directory structure.")
+    
+    print(f"Loading reference data from: {test_path}")
+    
+    try:
+        test_samples = pd.read_csv(test_path, encoding="utf-8")
+        print(f"Loaded {len(test_samples)} reference samples")
+        return test_samples
+    except Exception as e:
+        print(f"Error loading file: {e}")
+        raise FileNotFoundError("Could not load the required data file.")
+
+def load_generated_summaries(summaries_path):
+    """
+    Load generated summaries from file.
+    """
+    if not os.path.exists(summaries_path):
+        raise FileNotFoundError(f"Could not find the summaries file at {summaries_path}")
+    
+    with open(summaries_path, 'r', encoding='utf-8') as f:
+        generated_summaries = [line.strip() for line in f.readlines()]
+    
+    return generated_summaries
+
+def detect_language(text, target_lang):
+    """
+    Detect if the text is in the target language.
+    This is a simplified approach and might need to be improved for production use.
     """
     try:
-        # 쿼리 텍스트 임베딩
-        query_embedding = retriever.encode([query_text], batch_size=1, max_length=8192)['dense_vecs']
-        
-        # 모든 예제 텍스트 임베딩
-        example_texts = shot_samples['text'].tolist()
-        example_embeddings = retriever.encode(example_texts, batch_size=12, max_length=8192)['dense_vecs']
-        
-        # 코사인 유사도 계산 - BGE-M3는 이미 정규화된 벡터를 반환하므로 내적(dot product)으로 계산
-        similarities = np.dot(query_embedding, example_embeddings.T)[0]
-        
-        # 가장 유사한 예제의 인덱스 찾기
-        most_similar_idx = np.argmax(similarities)
-        similarity_score = similarities[most_similar_idx]
-        
-        print(f"Selected example index: {most_similar_idx} with similarity score: {similarity_score:.4f}")
-        
-        return most_similar_idx, float(similarity_score)
-    except Exception as e:
-        print(f"Error finding similar example: {e}")
-        # 오류가 발생하면 첫 번째 예제 사용
-        return 0, 0.0
-
-# CSV 결과 파일 생성 및 헤더 작성
-with open(csv_output_file, 'w', newline='', encoding='utf-8') as csv_file:
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['sample_id', 'query_text', 'example_text', 'example_summary', 
-                         'raw_model_output', 'cleaned_output', 'reference_summary', 
-                         'rouge1', 'rouge2', 'rougeL', 'rougeLsum', 'example_idx', 'similarity_score'])
-
-# 디버깅 로그 파일 생성
-debug_log_path = os.path.join(log_dir, f"{output_name}_extraction_debug.txt")
-debug_file = open(debug_log_path, "w", encoding="utf-8")
-
-# 예시 인덱스와 유사도 점수를 저장할 리스트
-example_indices = []
-similarity_scores = []
-
-# 메인 생성 및 결과 저장
-print(f"Starting inference for {MAX_SAMPLES} samples, writing results to {output_dir}.txt")
-with open(output_dir + '.txt', 'w', encoding='utf-8') as fp:
-    for i in tqdm(range(min(MAX_SAMPLES, len(test_samples)))):
-        if i not in oom_list:
-            try:
-                # BGE-M3 모델로 가장 유사한 예시 찾기
-                example_idx, similarity_score = find_most_similar_example(test_samples['text'][i], shot_samples, retriever)
-                example_indices.append(example_idx)
-                similarity_scores.append(similarity_score)
-                
-                # 이전 스타일의 간단한 프롬프트 형식 사용
-                one_shot_sample = f"""Please summarize the following text in {language}
-Text:{shot_samples['text'][example_idx]}
-Translated summary:{shot_samples['summary'][example_idx]}
-"""
-                
-                prompt = f"""Please summarize the following text in {language}
-Text:{test_samples['text'][i]}
-Translated summary:"""
-                
-                final_prompt = one_shot_sample + "\n" + prompt
-                
-                # 각 샘플의 프롬프트를 별도의 파일로 저장
-                prompt_file_path = os.path.join(samples_dir, f"sample_{i}_prompt.txt")
-                with open(prompt_file_path, "w", encoding="utf-8") as prompt_file:
-                    prompt_file.write(final_prompt)
-                
-                # 채팅 템플릿 사용 (Mistral v0.3에 적합)
-                messages = [
-                    {"role": "user", "content": final_prompt}
-                ]
-                chat_input = tokenizer.apply_chat_template(messages, return_tensors="pt")
-                chat_input = chat_input.to(device)
-                
-                with torch.no_grad():
-                    if use_model_engine:
-                        # Use DeepSpeed engine
-                        generated_ids = model_engine.module.generate(
-                            chat_input, 
-                            max_new_tokens=512, 
-                            do_sample=False, 
-                            pad_token_id=tokenizer.eos_token_id
-                        )
-                    else:
-                        # Standard model generation
-                        generated_ids = model.generate(
-                            chat_input, 
-                            max_new_tokens=512, 
-                            do_sample=False, 
-                            pad_token_id=tokenizer.eos_token_id
-                        )
-                
-                # 전체 출력 디코딩
-                full_output = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
-                
-                # 각 샘플의 완전한 출력을 별도의 파일로 저장
-                sample_file_path = os.path.join(samples_dir, f"sample_{i}_full_output.txt")
-                with open(sample_file_path, "w", encoding="utf-8") as sample_file:
-                    sample_file.write("="*80 + "\n")
-                    sample_file.write(f"PROMPT:\n")
-                    sample_file.write("="*80 + "\n")
-                    sample_file.write(final_prompt)
-                    sample_file.write("\n\n")
-                    
-                    sample_file.write("="*80 + "\n")
-                    sample_file.write(f"RAW MODEL OUTPUT:\n")
-                    sample_file.write("="*80 + "\n")
-                    sample_file.write(full_output)
-                    sample_file.write("\n\n")
-                
-                # 메인 출력 파일에 저장
-                fp.write(full_output.replace("\n", " ") + "\n")
-                
-                # Free up memory
-                del chat_input, generated_ids
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    print(f"CUDA OOM error for index {i}, skipping...")
-                    oom_list.append(i)
-                    fp.write('\n')
-                    example_indices.append(-1)
-                    similarity_scores.append(0.0)
-                    
-                    # CSV에 오류 행 추가
-                    with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-                        csv_writer = csv.writer(csv_file)
-                        csv_writer.writerow([i, "OOM ERROR", "", "", "", "", "", 0, 0, 0, 0, -1, 0])
-                    
-                    torch.cuda.empty_cache()
-                else:
-                    print(f"Error processing index {i}: {str(e)}")
-                    fp.write('\n')
-                    example_indices.append(-1)
-                    similarity_scores.append(0.0)
-                    
-                    # CSV에 오류 행 추가
-                    with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-                        csv_writer = csv.writer(csv_file)
-                        csv_writer.writerow([i, f"ERROR: {str(e)[:100]}", "", "", "", "", "", 0, 0, 0, 0, -1, 0])
-                    
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Unexpected error for index {i}: {str(e)}")
-                fp.write('\n')
-                example_indices.append(-1)
-                similarity_scores.append(0.0)
-                
-                # CSV에 오류 행 추가
-                with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-                    csv_writer = csv.writer(csv_file)
-                    csv_writer.writerow([i, f"ERROR: {str(e)[:100]}", "", "", "", "", "", 0, 0, 0, 0, -1, 0])
-        else:
-            fp.write('\n')
-            example_indices.append(-1)
-            similarity_scores.append(0.0)
+        import fasttext
+        # Attempt to load the language detection model
+        try:
+            model_path = './lid.176.bin'
+            if not os.path.exists(model_path):
+                model_path = './lid.176.ftz'
+                if not os.path.exists(model_path):
+                    print("Language detection model not found. Skipping language detection.")
+                    return True
             
-            # CSV에 건너뛴 행 추가
-            with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-                csv_writer = csv.writer(csv_file)
-                csv_writer.writerow([i, "SKIPPED", "", "", "", "", "", 0, 0, 0, 0, -1, 0])
+            model = fasttext.load_model(model_path)
+            prediction = model.predict(text.replace('\n', ' '), k=1)
+            detected_lang = prediction[0][0].replace('__label__', '')
+            
+            # Language code mapping
+            lang_map = {
+                'english': 'en',
+                'thai': 'th',
+                'gujarati': 'gu',
+                'marathi': 'mr',
+                'pashto': 'ps',
+                'burmese': 'my',
+                'sinhala': 'si'
+            }
+            
+            target_code = lang_map.get(target_lang, target_lang)
+            return detected_lang == target_code
+            
+        except Exception as e:
+            print(f"Error in language detection: {e}")
+            return True  # Assume it's correct if detection fails
+    
+    except ImportError:
+        print("Fasttext not installed. Skipping language detection.")
+        return True  # Assume it's correct if fasttext is not installed
 
-# 출력 데이터를 미리 저장
-original_responses = []
-with open(output_dir + '.txt', "r", encoding="utf-8") as file:
-    original_responses = file.readlines()
+def calculate_rouge(prediction, reference):
+    """
+    Calculate ROUGE scores for a prediction and reference.
+    """
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    
+    # Handle empty strings
+    if not prediction or not reference:
+        return {'rouge1': 0, 'rouge2': 0, 'rougeL': 0}
+    
+    # Tokenize into sentences
+    try:
+        pred_sents = "\n".join(sent_tokenize(prediction))
+        ref_sents = "\n".join(sent_tokenize(reference))
+    except:
+        # Fallback for tokenization errors
+        pred_sents = prediction
+        ref_sents = reference
+    
+    # Calculate scores
+    scores = scorer.score(ref_sents, pred_sents)
+    
+    return {
+        'rouge1': scores['rouge1'].fmeasure,
+        'rouge2': scores['rouge2'].fmeasure,
+        'rougeL': scores['rougeL'].fmeasure
+    }
 
-# 후처리 및 결과 저장
-print("Processing generated outputs...")
-cleansed_output_path = os.path.join(cleansed_output_dir, f"{os.path.basename(output_dir)}.txt")
+def calculate_bertscore(predictions, references, lang):
+    """
+    Calculate BERTScore for a set of predictions and references.
+    Requires bert_score package.
+    """
+    try:
+        from bert_score import score
+        
+        # Language code mapping
+        lang_map = {
+            'english': 'en',
+            'thai': 'th',
+            'gujarati': 'gu',
+            'marathi': 'mr',
+            'pashto': 'ps',
+            'burmese': 'my',
+            'sinhala': 'si'
+        }
+        
+        lang_code = lang_map.get(lang, 'en')
+        
+        # Calculate BERTScore
+        precision, recall, f1 = score(predictions, references, lang=lang_code, verbose=True)
+        
+        # Convert to numpy arrays and then to Python lists
+        precision_list = precision.cpu().numpy().tolist()
+        recall_list = recall.cpu().numpy().tolist()
+        f1_list = f1.cpu().numpy().tolist()
+        
+        return precision_list, recall_list, f1_list
+    
+    except ImportError:
+        print("BERTScore package not installed. Skipping BERTScore calculation.")
+        return [0] * len(predictions), [0] * len(predictions), [0] * len(predictions)
 
-# 인덱스 문제 해결: test_samples의 길이만큼만 처리
-summaries = []
-for i in range(min(len(original_responses), len(test_samples))):
-    if i < len(original_responses):
-        extracted_summary = extract_translation_from_response(original_responses[i], i, debug_file)
-        cleaned_summary = clean_summary(extracted_summary)
-        summaries.append(cleaned_summary)
+def create_plots(metrics_df, model_name, lang_pair, output_dir):
+    """
+    Create plots for visualization of evaluation metrics.
+    """
+    # Create figures directory if it doesn't exist
+    figures_dir = os.path.join(output_dir, 'figures')
+    os.makedirs(figures_dir, exist_ok=True)
+    
+    # 1. ROUGE scores distribution
+    plt.figure(figsize=(10, 6))
+    plt.hist(metrics_df['rouge1'], bins=20, alpha=0.5, label='ROUGE-1')
+    plt.hist(metrics_df['rouge2'], bins=20, alpha=0.5, label='ROUGE-2')
+    plt.hist(metrics_df['rougeL'], bins=20, alpha=0.5, label='ROUGE-L')
+    plt.xlabel('Score')
+    plt.ylabel('Frequency')
+    plt.title(f'ROUGE Scores Distribution - {model_name} ({lang_pair})')
+    plt.legend()
+    plt.savefig(os.path.join(figures_dir, 'rouge_distribution.png'))
+    plt.close()
+    
+    # 2. Correct Language Rate
+    if 'is_correct_lang' in metrics_df.columns:
+        correct_count = metrics_df['is_correct_lang'].sum()
+        incorrect_count = len(metrics_df) - correct_count
+        plt.figure(figsize=(8, 8))
+        plt.pie([correct_count, incorrect_count], 
+                labels=['Correct Language', 'Incorrect Language'],
+                autopct='%1.1f%%',
+                colors=['#4CAF50', '#F44336'])
+        plt.title(f'Language Correctness - {model_name} ({lang_pair})')
+        plt.savefig(os.path.join(figures_dir, 'language_correctness.png'))
+        plt.close()
+    
+    # 3. ROUGE scores by sample index
+    plt.figure(figsize=(12, 6))
+    plt.plot(metrics_df.index, metrics_df['rouge1'], label='ROUGE-1')
+    plt.plot(metrics_df.index, metrics_df['rouge2'], label='ROUGE-2')
+    plt.plot(metrics_df.index, metrics_df['rougeL'], label='ROUGE-L')
+    plt.xlabel('Sample Index')
+    plt.ylabel('Score')
+    plt.title(f'ROUGE Scores by Sample - {model_name} ({lang_pair})')
+    plt.legend()
+    plt.savefig(os.path.join(figures_dir, 'rouge_by_sample.png'))
+    plt.close()
+    
+    print(f"Plots saved to {figures_dir}")
+
+def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Evaluate Cross-Lingual Summarization outputs')
+    
+    # Required arguments - but with defaults as None to allow interactive mode
+    parser.add_argument('--model', type=str, choices=['mistral', 'llama', 'gpt3.5', 'gpt4'],
+                        help='Model used for summarization')
+    
+    parser.add_argument('--src_lang', type=str,
+                        choices=['english', 'thai', 'gujarati', 'marathi', 'pashto', 'burmese', 'sinhala'],
+                        help='Source language')
+    
+    parser.add_argument('--tgt_lang', type=str,
+                        choices=['english', 'thai', 'gujarati', 'marathi', 'pashto', 'burmese', 'sinhala'],
+                        help='Target language')
+    
+    # Optional arguments
+    parser.add_argument('--bertscore', action='store_true',
+                        help='Calculate BERTScore (requires additional packages)')
+    
+    parser.add_argument('--plot', action='store_true',
+                        help='Generate visualization plots')
+    
+    parser.add_argument('--summaries_path', type=str, default=None,
+                        help='Path to generated summaries file (overrides default path)')
+    
+    args = parser.parse_args()
+    
+    # Interactive mode if required arguments are not provided
+    if args.model is None:
+        print("Please select the model to evaluate:")
+        print("1. mistral (Mistral-7B-Instruct-v0.3)")
+        print("2. llama (Llama-3-70B-Instruct)")
+        print("3. gpt3.5 (GPT-3.5-turbo)")
+        print("4. gpt4 (GPT-4o-mini)")
+        model_choice = input("Enter your choice (1-4): ")
+        model_options = {
+            '1': 'mistral',
+            '2': 'llama',
+            '3': 'gpt3.5',
+            '4': 'gpt4'
+        }
+        args.model = model_options.get(model_choice, 'mistral')
+    
+    if args.src_lang is None:
+        print("\nPlease select the source language:")
+        print("1. english")
+        print("2. thai")
+        print("3. gujarati")
+        print("4. marathi")
+        print("5. pashto")
+        print("6. burmese")
+        print("7. sinhala")
+        lang_choice = input("Enter your choice (1-7): ")
+        lang_options = {
+            '1': 'english',
+            '2': 'thai',
+            '3': 'gujarati',
+            '4': 'marathi',
+            '5': 'pashto',
+            '6': 'burmese',
+            '7': 'sinhala'
+        }
+        args.src_lang = lang_options.get(lang_choice, 'english')
+    
+    if args.tgt_lang is None:
+        print("\nPlease select the target language:")
+        print("1. english")
+        print("2. thai")
+        print("3. gujarati")
+        print("4. marathi")
+        print("5. pashto")
+        print("6. burmese")
+        print("7. sinhala")
+        lang_choice = input("Enter your choice (1-7): ")
+        lang_options = {
+            '1': 'english',
+            '2': 'thai',
+            '3': 'gujarati',
+            '4': 'marathi',
+            '5': 'pashto',
+            '6': 'burmese',
+            '7': 'sinhala'
+        }
+        args.tgt_lang = lang_options.get(lang_choice, 'english')
+    
+    # Validate languages are different
+    if args.src_lang == args.tgt_lang:
+        raise ValueError("Source and target languages must be different. Please run again with different languages.")
+    
+    # Print configuration
+    print("\n===== Evaluation Configuration =====")
+    print(f"Model: {args.model}")
+    print(f"Source Language: {args.src_lang}")
+    print(f"Target Language: {args.tgt_lang}")
+    print(f"Calculate BERTScore: {args.bertscore}")
+    print(f"Generate plots: {args.plot}")
+    print("===================================\n")
+    
+    # Set up paths and language format
+    model_name = args.model
+    src_lang = args.src_lang
+    tgt_lang = args.tgt_lang
+    lang_pair = f"{src_lang}-{tgt_lang}"
+    
+    # Target language formatting
+    target_language = tgt_lang.capitalize()
+    
+    # Set up output directories
+    output_paths = setup_output_directories(model_name, lang_pair)
+    
+    # Override summaries path if provided
+    if args.summaries_path:
+        summaries_path = args.summaries_path
     else:
-        summaries.append("")  # 부족한 부분은 빈 문자열로 채움
-
-# 추출된 요약을 파일로 저장
-with open(cleansed_output_path, "w", encoding="utf-8") as file:
-    file.write("\n".join(summaries))
-
-print(f"Cleansed summaries saved to {cleansed_output_path}")
-
-# 디버그 파일 닫기
-debug_file.close()
-
-# ROUGE 평가 - 수정된 방식으로 구현
-print("Calculating ROUGE metrics...")
-
-# 수정된 방식으로 참조 요약 가져오기
-scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL', 'rougeLsum'])
-dec_summaries = summaries
-
-# 인덱스 문제 해결: test_samples에서 직접 참조 요약 추출
-rouge_scores = []
-for i in range(len(summaries)):
-    # test_samples 범위를 벗어나면 건너뜀
-    if i >= len(test_samples):
-        print(f"Skipping ROUGE calculation for sample {i}: index out of range")
-        continue
-        
-    # 빈 요약 또는 오류가 있는 경우 건너뜀
-    if not summaries[i]:
-        print(f"Skipping ROUGE calculation for sample {i}: empty summary")
-        continue
+        summaries_path = output_paths["summaries_path"]
     
-    try:
-        # 직접 test_samples에서 참조 요약 추출
-        ref_summary = test_samples['summary'][i]
-        
-        # 문장 토큰화 적용
-        pred_sents = "\n".join(sent_tokenize(summaries[i]))
-        ref_sents = "\n".join(sent_tokenize(ref_summary))
-        
-        scores = scorer.score(ref_sents, pred_sents)
-        
-        # 점수 추출
-        rouge1 = scores['rouge1'][2]  # F1 점수
-        rouge2 = scores['rouge2'][2]  # F1 점수
-        rougeL = scores['rougeL'][2]  # F1 점수
-        rougeLsum = scores['rougeLsum'][2]  # F1 점수
-        
-        rouge_scores.append({
-            'rouge-1_f': rouge1, 
-            'rouge-2_f': rouge2, 
-            'rouge-l_f': rougeL,
-            'rouge-l-sum_f': rougeLsum
+    # Load data
+    print("Loading reference data...")
+    test_samples = load_data(src_lang, tgt_lang)
+    
+    # Load generated summaries
+    print("Loading generated summaries...")
+    generated_summaries = load_generated_summaries(summaries_path)
+    
+    # Ensure the number of summaries matches the number of test samples
+    if len(generated_summaries) < len(test_samples):
+        print(f"Warning: Generated summaries ({len(generated_summaries)}) are fewer than test samples ({len(test_samples)})")
+        # Truncate test samples to match the number of summaries
+        test_samples = test_samples.iloc[:len(generated_summaries)]
+    elif len(generated_summaries) > len(test_samples):
+        print(f"Warning: Generated summaries ({len(generated_summaries)}) are more than test samples ({len(test_samples)})")
+        # Truncate generated summaries to match the number of test samples
+        generated_summaries = generated_summaries[:len(test_samples)]
+    
+    # Initialize metrics
+    metrics = {
+        'sample_id': [],
+        'rouge1': [],
+        'rouge2': [],
+        'rougeL': [],
+        'is_correct_lang': [],
+        'summary_length': []
+    }
+    
+    # Add BERTScore columns if requested
+    if args.bertscore:
+        metrics.update({
+            'bertscore_precision': [],
+            'bertscore_recall': [],
+            'bertscore_f1': []
         })
-        
-        # 예제 인덱스와 유사도 점수 가져오기
-        example_idx = example_indices[i] if i < len(example_indices) else -1
-        similarity_score = similarity_scores[i] if i < len(similarity_scores) else 0.0
-        
-        # CSV에 개별 점수 추가
-        with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-            csv_writer = csv.writer(csv_file)
-            
-            # 텍스트 필드에서 CSV 구분자 문제를 방지하기 위한 전처리
-            query_text = test_samples['text'][i].replace('\n', ' ').replace('\r', '')
-            
-            if example_idx >= 0 and example_idx < len(shot_samples):
-                example_text = shot_samples['text'][example_idx].replace('\n', ' ').replace('\r', '')
-                example_summary = shot_samples['summary'][example_idx].replace('\n', ' ').replace('\r', '')
-            else:
-                example_text = ""
-                example_summary = ""
-                
-            raw_output = original_responses[i].replace('\n', ' ').replace('\r', '') if i < len(original_responses) else ""
-            cleaned_output_csv = summaries[i].replace('\n', ' ').replace('\r', '')
-            reference_summary_csv = ref_summary.replace('\n', ' ').replace('\r', '')
-            
-            # CSV 행 작성
-            csv_writer.writerow([
-                i,  # sample_id
-                query_text,  # query_text
-                example_text,  # example_text
-                example_summary,  # example_summary
-                raw_output,  # raw_model_output
-                cleaned_output_csv,  # cleaned_output
-                reference_summary_csv,  # reference_summary
-                rouge1,  # rouge1
-                rouge2,  # rouge2
-                rougeL,  # rougeL
-                rougeLsum,  # rougeLsum
-                example_idx,  # 사용된 예제 인덱스
-                similarity_score  # 유사도 점수
-            ])
-        
-    except Exception as e:
-        print(f"Error calculating ROUGE for sample {i}: {e}")
-        continue
-
-# 평균 ROUGE 점수 계산 및 출력
-if rouge_scores:
-    print("eval_rouge1: ", round(sum([item['rouge-1_f'] for item in rouge_scores]) / len(rouge_scores), 4))
-    print("eval_rouge2: ", round(sum([item['rouge-2_f'] for item in rouge_scores]) / len(rouge_scores), 4))
-    print("eval_rougeL: ", round(sum([item['rouge-l_f'] for item in rouge_scores]) / len(rouge_scores), 4))
-    print("eval_rougeLsum: ", round(sum([item['rouge-l-sum_f'] for item in rouge_scores]) / len(rouge_scores), 4))
     
-    avg_rouge1 = round(sum([item['rouge-1_f'] for item in rouge_scores]) / len(rouge_scores), 4)
-    avg_rouge2 = round(sum([item['rouge-2_f'] for item in rouge_scores]) / len(rouge_scores), 4)
-    avg_rougeL = round(sum([item['rouge-l_f'] for item in rouge_scores]) / len(rouge_scores), 4)
-    avg_rougeLsum = round(sum([item['rouge-l-sum_f'] for item in rouge_scores]) / len(rouge_scores), 4)
+    # Process each sample
+    print("Evaluating summaries...")
+    for i in tqdm(range(len(test_samples))):
+        try:
+            reference = test_samples['summary'][i]
+            generated = generated_summaries[i]
+            
+            # Calculate ROUGE scores
+            rouge_scores = calculate_rouge(generated, reference)
+            
+            # Check if the generated summary is in the correct language
+            is_correct_lang = detect_language(generated, tgt_lang)
+            
+            # Store metrics
+            metrics['sample_id'].append(i)
+            metrics['rouge1'].append(rouge_scores['rouge1'])
+            metrics['rouge2'].append(rouge_scores['rouge2'])
+            metrics['rougeL'].append(rouge_scores['rougeL'])
+            metrics['is_correct_lang'].append(int(is_correct_lang))
+            metrics['summary_length'].append(len(generated))
+            
+        except Exception as e:
+            print(f"Error processing sample {i}: {e}")
+            # Add empty values for this sample
+            metrics['sample_id'].append(i)
+            metrics['rouge1'].append(0)
+            metrics['rouge2'].append(0)
+            metrics['rougeL'].append(0)
+            metrics['is_correct_lang'].append(0)
+            metrics['summary_length'].append(0)
     
-    # 최종 메트릭을 CSV에 추가
-    with open(csv_output_file, 'a', newline='', encoding='utf-8') as csv_file:
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([])  # 빈 행 추가
-        csv_writer.writerow(["SUMMARY", "", "", "", "", "", "", "", "", "", "", "", ""])
-        csv_writer.writerow(["Average", "", "", "", "", "", "", avg_rouge1, avg_rouge2, avg_rougeL, avg_rougeLsum, "", ""])
-        csv_writer.writerow(["Processed", len(rouge_scores), "out of", MAX_SAMPLES, "", "", "", "", "", "", "", "", ""])
-        csv_writer.writerow(["Skipped/Errors", len(oom_list), "", "", "", "", "", "", "", "", "", "", ""])
-else:
-    print("No valid samples for ROUGE calculation")
+    # Calculate BERTScore if requested
+    if args.bertscore:
+        print("Calculating BERTScore...")
+        try:
+            precisions, recalls, f1s = calculate_bertscore(
+                [s for s in generated_summaries if s],  # Skip empty strings
+                [test_samples['summary'][i] for i in range(len(generated_summaries)) if generated_summaries[i]],
+                tgt_lang
+            )
+            
+            # Add scores to metrics
+            score_idx = 0
+            for i in range(len(test_samples)):
+                if i < len(generated_summaries) and generated_summaries[i]:
+                    metrics['bertscore_precision'].append(precisions[score_idx])
+                    metrics['bertscore_recall'].append(recalls[score_idx])
+                    metrics['bertscore_f1'].append(f1s[score_idx])
+                    score_idx += 1
+                else:
+                    metrics['bertscore_precision'].append(0)
+                    metrics['bertscore_recall'].append(0)
+                    metrics['bertscore_f1'].append(0)
+        except Exception as e:
+            print(f"Error calculating BERTScore: {e}")
+            for i in range(len(test_samples)):
+                metrics['bertscore_precision'].append(0)
+                metrics['bertscore_recall'].append(0)
+                metrics['bertscore_f1'].append(0)
+    
+    # Create a DataFrame from the metrics
+    metrics_df = pd.DataFrame(metrics)
+    
+    # Save metrics to CSV
+    metrics_df.to_csv(output_paths["metrics_path"], index=False)
+    print(f"Metrics saved to {output_paths['metrics_path']}")
+    
+    # Calculate and save final metrics
+    avg_rouge1 = metrics_df['rouge1'].mean()
+    avg_rouge2 = metrics_df['rouge2'].mean()
+    avg_rougeL = metrics_df['rougeL'].mean()
+    correct_lang_rate = metrics_df['is_correct_lang'].mean() * 100
+    avg_length = metrics_df['summary_length'].mean()
+    
+    # Add BERTScore averages if available
+    bertscore_metrics = ""
+    if args.bertscore and 'bertscore_f1' in metrics_df.columns:
+        avg_bertscore_precision = metrics_df['bertscore_precision'].mean()
+        avg_bertscore_recall = metrics_df['bertscore_recall'].mean()
+        avg_bertscore_f1 = metrics_df['bertscore_f1'].mean()
+        bertscore_metrics = f"Average BERTScore Precision: {avg_bertscore_precision:.4f}\n" \
+                           f"Average BERTScore Recall: {avg_bertscore_recall:.4f}\n" \
+                           f"Average BERTScore F1: {avg_bertscore_f1:.4f}\n"
+    
+    with open(output_paths["final_metrics_path"], "w", encoding="utf-8") as f:
+        f.write(f"Model: {model_name}\n")
+        f.write(f"Language Pair: {lang_pair}\n\n")
+        f.write(f"Average ROUGE-1: {avg_rouge1:.4f}\n")
+        f.write(f"Average ROUGE-2: {avg_rouge2:.4f}\n")
+        f.write(f"Average ROUGE-L: {avg_rougeL:.4f}\n")
+        f.write(bertscore_metrics)
+        f.write(f"Correct Language Rate: {correct_lang_rate:.2f}%\n")
+        f.write(f"Average Summary Length: {avg_length:.1f} characters\n")
+        f.write(f"Processed: {len(metrics_df)}/{len(test_samples)} samples\n")
+    
+    # Print final metrics
+    print("\n===== Final Metrics =====")
+    print(f"Average ROUGE-1: {avg_rouge1:.4f}")
+    print(f"Average ROUGE-2: {avg_rouge2:.4f}")
+    print(f"Average ROUGE-L: {avg_rougeL:.4f}")
+    if args.bertscore and 'bertscore_f1' in metrics_df.columns:
+        print(f"Average BERTScore F1: {avg_bertscore_f1:.4f}")
+    print(f"Correct Language Rate: {correct_lang_rate:.2f}%")
+    print(f"Average Summary Length: {avg_length:.1f} characters")
+    print(f"Processed: {len(metrics_df)}/{len(test_samples)} samples")
+    
+    # Create plots if requested
+    if args.plot:
+        print("\nGenerating plots...")
+        create_plots(metrics_df, model_name, lang_pair, output_paths["eval_dir"])
+    
+    print(f"\nEvaluation complete. Results saved to {output_paths['eval_dir']}")
 
-print(f"\nProcessing complete.")
-print(f"All results are saved in CSV format at: {csv_output_file}")
-print(f"Sample outputs are saved in: {samples_dir}")
-print(f"Cleansed outputs are saved in: {cleansed_output_path}")
+if __name__ == "__main__":
+    main()
